@@ -1,0 +1,633 @@
+#!/usr/bin/env python3
+"""
+GitHub Migration Validator
+Compares source and target GitHub instances to validate a migration.
+
+Usage:
+    python github_migration_validator.py \
+        --source-url https://source.github.example.com \
+        --source-token <PAT> \
+        --target-url https://target.github.example.com \
+        --target-token <PAT> \
+        --org my-org \
+        [--repos repo1 repo2] \
+        [--output-format json|html|both] \
+        [--output-dir ./reports]
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+from dataclasses import dataclass, field, asdict
+from datetime import datetime
+from typing import Optional
+import urllib.request
+import urllib.error
+
+
+# ---------------------------------------------------------------------------
+# Data models
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CheckResult:
+    name: str
+    passed: bool
+    source_value: str = "https://github.com/deeksha-sisodiya/github_migration_source.git"
+    target_value: str = "https://github.com/deeksha-sisodiya/github_migration_target.git"
+    notes: str = ""
+
+
+@dataclass
+class RepoReport:
+    repo: str
+    checks: list[CheckResult] = field(default_factory=list)
+
+    @property
+    def passed(self) -> bool:
+        return all(c.passed for c in self.checks)
+
+    @property
+    def fail_count(self) -> int:
+        return sum(1 for c in self.checks if not c.passed)
+
+
+@dataclass
+class MigrationReport:
+    org: str
+    source_url: str
+    target_url: str
+    generated_at: str
+    repo_reports: list[RepoReport] = field(default_factory=list)
+
+    @property
+    def total_repos(self) -> int:
+        return len(self.repo_reports)
+
+    @property
+    def passed_repos(self) -> int:
+        return sum(1 for r in self.repo_reports if r.passed)
+
+    @property
+    def failed_repos(self) -> int:
+        return self.total_repos - self.passed_repos
+
+
+# ---------------------------------------------------------------------------
+# GitHub API client
+# ---------------------------------------------------------------------------
+
+class GitHubClient:
+    def __init__(self, base_url: str, token: str):
+        # Normalize: strip trailing slash, ensure /api/v3 for GHE
+        base_url = base_url.rstrip("/")
+        if "github.com" in base_url and "api.github.com" not in base_url:
+            self.api_base = "https://api.github.com"
+        else:
+            self.api_base = base_url if base_url.endswith("/api/v3") else f"{base_url}/api/v3"
+        self.token = token
+
+    def _request(self, path: str, page: int = 1, per_page: int = 100) -> dict | list:
+        sep = "&" if "?" in path else "?"
+        url = f"{self.api_base}{path}{sep}per_page={per_page}&page={page}"
+        req = urllib.request.Request(url, headers={
+            "Authorization": f"token {self.token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"HTTP {e.code} for {url}: {body[:200]}") from e
+
+    def _paginate(self, path: str, per_page: int = 100) -> list:
+        results = []
+        page = 1
+        while True:
+            data = self._request(path, page=page, per_page=per_page)
+            if not data:
+                break
+            results.extend(data)
+            if len(data) < per_page:
+                break
+            page += 1
+            time.sleep(0.1)   # be polite to the API
+        return results
+
+    # --- Org-level ---
+
+    def list_repos(self, org: str) -> list[dict]:
+        return self._paginate(f"/orgs/{org}/repos")
+
+    # --- Repo-level ---
+
+    def get_repo(self, org: str, repo: str) -> dict:
+        return self._request(f"/repos/{org}/{repo}")
+
+    def list_branches(self, org: str, repo: str) -> list[dict]:
+        return self._paginate(f"/repos/{org}/{repo}/branches")
+
+    def list_tags(self, org: str, repo: str) -> list[dict]:
+        return self._paginate(f"/repos/{org}/{repo}/tags")
+
+    def list_commits(self, org: str, repo: str, sha: str = "HEAD",
+                     per_page: int = 1) -> list[dict]:
+        return self._request(f"/repos/{org}/{repo}/commits?sha={sha}",
+                              per_page=per_page)
+
+    def count_commits(self, org: str, repo: str) -> int:
+        """Use the contributor stats endpoint as a proxy for total commit count."""
+        # Faster than paginating /commits
+        data = self._request(f"/repos/{org}/{repo}/contributors?anon=1",
+                              per_page=100)
+        if isinstance(data, list):
+            return sum(c.get("contributions", 0) for c in data)
+        return -1
+
+    def list_pull_requests(self, org: str, repo: str, state: str = "all") -> list[dict]:
+        return self._paginate(f"/repos/{org}/{repo}/pulls?state={state}")
+
+    def list_issues(self, org: str, repo: str, state: str = "all") -> list[dict]:
+        # /issues returns both issues and PRs; filter out PRs
+        all_items = self._paginate(f"/repos/{org}/{repo}/issues?state={state}")
+        return [i for i in all_items if "pull_request" not in i]
+
+    def list_labels(self, org: str, repo: str) -> list[dict]:
+        return self._paginate(f"/repos/{org}/{repo}/labels")
+
+    def list_milestones(self, org: str, repo: str) -> list[dict]:
+        return self._paginate(f"/repos/{org}/{repo}/milestones?state=all")
+
+    def list_branch_protections(self, org: str, repo: str) -> list[dict]:
+        branches = self.list_branches(org, repo)
+        protected = []
+        for b in branches:
+            if b.get("protected"):
+                try:
+                    detail = self._request(
+                        f"/repos/{org}/{repo}/branches/{b['name']}/protection")
+                    protected.append({"branch": b["name"], "rules": detail})
+                except RuntimeError:
+                    protected.append({"branch": b["name"], "rules": "error"})
+        return protected
+
+    def list_collaborators(self, org: str, repo: str) -> list[dict]:
+        return self._paginate(f"/repos/{org}/{repo}/collaborators")
+
+    def list_webhooks(self, org: str, repo: str) -> list[dict]:
+        try:
+            return self._paginate(f"/repos/{org}/{repo}/hooks")
+        except RuntimeError:
+            return []   # 404 means no webhooks or no permission
+
+
+# ---------------------------------------------------------------------------
+# Individual check functions
+# ---------------------------------------------------------------------------
+
+def check_repo_metadata(src: GitHubClient, tgt: GitHubClient,
+                        org: str, repo: str) -> list[CheckResult]:
+    results = []
+    try:
+        s = src.get_repo(org, repo)
+        t = tgt.get_repo(org, repo)
+    except RuntimeError as e:
+        return [CheckResult("repo_exists", False, notes=str(e))]
+
+    fields = [
+        ("default_branch", "Default branch"),
+        ("private",        "Visibility (private flag)"),
+        ("description",    "Description"),
+        ("has_issues",     "Issues enabled"),
+        ("has_wiki",       "Wiki enabled"),
+        ("has_projects",   "Projects enabled"),
+    ]
+    for key, label in fields:
+        sv, tv = str(s.get(key)), str(t.get(key))
+        results.append(CheckResult(
+            name=f"repo_meta:{key}",
+            passed=(sv == tv),
+            source_value=sv,
+            target_value=tv,
+            notes=label,
+        ))
+    return results
+
+
+def check_branches(src: GitHubClient, tgt: GitHubClient,
+                   org: str, repo: str) -> list[CheckResult]:
+    src_branches = {b["name"]: b["commit"]["sha"] for b in src.list_branches(org, repo)}
+    tgt_branches = {b["name"]: b["commit"]["sha"] for b in tgt.list_branches(org, repo)}
+
+    results = [CheckResult(
+        name="branches:count",
+        passed=(len(src_branches) == len(tgt_branches)),
+        source_value=str(len(src_branches)),
+        target_value=str(len(tgt_branches)),
+        notes="Total branch count",
+    )]
+
+    missing = set(src_branches) - set(tgt_branches)
+    extra   = set(tgt_branches) - set(src_branches)
+    results.append(CheckResult(
+        name="branches:names",
+        passed=(not missing and not extra),
+        source_value=", ".join(sorted(src_branches)) or "(none)",
+        target_value=", ".join(sorted(tgt_branches)) or "(none)",
+        notes=f"Missing: {sorted(missing) or '–'}  Extra: {sorted(extra) or '–'}",
+    ))
+
+    for name in src_branches:
+        if name in tgt_branches:
+            sv, tv = src_branches[name], tgt_branches[name]
+            results.append(CheckResult(
+                name=f"branches:sha:{name}",
+                passed=(sv == tv),
+                source_value=sv[:12],
+                target_value=tv[:12],
+                notes=f"HEAD SHA for branch '{name}'",
+            ))
+    return results
+
+
+def check_tags(src: GitHubClient, tgt: GitHubClient,
+               org: str, repo: str) -> list[CheckResult]:
+    src_tags = {t["name"]: t["commit"]["sha"] for t in src.list_tags(org, repo)}
+    tgt_tags = {t["name"]: t["commit"]["sha"] for t in tgt.list_tags(org, repo)}
+
+    missing = set(src_tags) - set(tgt_tags)
+    return [
+        CheckResult(
+            name="tags:count",
+            passed=(len(src_tags) == len(tgt_tags)),
+            source_value=str(len(src_tags)),
+            target_value=str(len(tgt_tags)),
+            notes="Total tag count",
+        ),
+        CheckResult(
+            name="tags:missing",
+            passed=(not missing),
+            source_value=str(len(src_tags)),
+            target_value=str(len(tgt_tags)),
+            notes=f"Tags missing in target: {sorted(missing)[:10] or '–'}",
+        ),
+    ]
+
+
+def check_commits(src: GitHubClient, tgt: GitHubClient,
+                  org: str, repo: str) -> list[CheckResult]:
+    results = []
+    try:
+        src_commits = src.list_commits(org, repo)
+        tgt_commits = tgt.list_commits(org, repo)
+        if src_commits and tgt_commits:
+            sv = src_commits[0]["sha"]
+            tv = tgt_commits[0]["sha"]
+            results.append(CheckResult(
+                name="commits:latest_sha",
+                passed=(sv == tv),
+                source_value=sv[:12],
+                target_value=tv[:12],
+                notes="Latest commit SHA on default branch",
+            ))
+    except RuntimeError as e:
+        results.append(CheckResult("commits:latest_sha", False, notes=str(e)))
+
+    try:
+        sc = src.count_commits(org, repo)
+        tc = tgt.count_commits(org, repo)
+        if sc > 0 and tc > 0:
+            results.append(CheckResult(
+                name="commits:total_count",
+                passed=(sc == tc),
+                source_value=str(sc),
+                target_value=str(tc),
+                notes="Approximate total commit count (via contributor stats)",
+            ))
+    except RuntimeError:
+        pass   # not critical if stats are unavailable
+
+    return results
+
+
+def check_pull_requests(src: GitHubClient, tgt: GitHubClient,
+                        org: str, repo: str) -> list[CheckResult]:
+    results = []
+    for state in ("open", "closed"):
+        src_prs = src.list_pull_requests(org, repo, state)
+        tgt_prs = tgt.list_pull_requests(org, repo, state)
+        results.append(CheckResult(
+            name=f"prs:{state}_count",
+            passed=(len(src_prs) == len(tgt_prs)),
+            source_value=str(len(src_prs)),
+            target_value=str(len(tgt_prs)),
+            notes=f"{state.capitalize()} PR count",
+        ))
+        src_titles = {pr["title"] for pr in src_prs}
+        tgt_titles = {pr["title"] for pr in tgt_prs}
+        missing = src_titles - tgt_titles
+        results.append(CheckResult(
+            name=f"prs:{state}_titles",
+            passed=(not missing),
+            source_value=str(len(src_titles)),
+            target_value=str(len(tgt_titles)),
+            notes=f"Missing titles (first 5): {list(missing)[:5] or '–'}",
+        ))
+    return results
+
+
+def check_issues(src: GitHubClient, tgt: GitHubClient,
+                 org: str, repo: str) -> list[CheckResult]:
+    results = []
+    for state in ("open", "closed"):
+        si = [i for i in src.list_issues(org, repo, state)]
+        ti = [i for i in tgt.list_issues(org, repo, state)]
+        results.append(CheckResult(
+            name=f"issues:{state}_count",
+            passed=(len(si) == len(ti)),
+            source_value=str(len(si)),
+            target_value=str(len(ti)),
+            notes=f"{state.capitalize()} issue count",
+        ))
+
+    # Labels
+    sl = {l["name"] for l in src.list_labels(org, repo)}
+    tl = {l["name"] for l in tgt.list_labels(org, repo)}
+    missing_labels = sl - tl
+    results.append(CheckResult(
+        name="issues:labels",
+        passed=(not missing_labels),
+        source_value=str(len(sl)),
+        target_value=str(len(tl)),
+        notes=f"Missing labels: {sorted(missing_labels)[:10] or '–'}",
+    ))
+
+    # Milestones
+    sm = {m["title"] for m in src.list_milestones(org, repo)}
+    tm = {m["title"] for m in tgt.list_milestones(org, repo)}
+    missing_ms = sm - tm
+    results.append(CheckResult(
+        name="issues:milestones",
+        passed=(not missing_ms),
+        source_value=str(len(sm)),
+        target_value=str(len(tm)),
+        notes=f"Missing milestones: {sorted(missing_ms)[:10] or '–'}",
+    ))
+    return results
+
+
+def check_settings(src: GitHubClient, tgt: GitHubClient,
+                   org: str, repo: str) -> list[CheckResult]:
+    results = []
+
+    # Branch protections
+    sp = src.list_branch_protections(org, repo)
+    tp = tgt.list_branch_protections(org, repo)
+    src_protected = {p["branch"] for p in sp}
+    tgt_protected = {p["branch"] for p in tp}
+    missing_prot = src_protected - tgt_protected
+    results.append(CheckResult(
+        name="settings:branch_protections",
+        passed=(not missing_prot),
+        source_value=str(len(src_protected)),
+        target_value=str(len(tgt_protected)),
+        notes=f"Branches missing protection rules: {sorted(missing_prot) or '–'}",
+    ))
+
+    # Collaborators
+    sc = {c["login"] for c in src.list_collaborators(org, repo)}
+    tc = {c["login"] for c in tgt.list_collaborators(org, repo)}
+    missing_collabs = sc - tc
+    results.append(CheckResult(
+        name="settings:collaborators",
+        passed=(not missing_collabs),
+        source_value=str(len(sc)),
+        target_value=str(len(tc)),
+        notes=f"Missing collaborators: {sorted(missing_collabs)[:10] or '–'}",
+    ))
+
+    # Webhooks (count-only — URLs/secrets differ across environments)
+    sw = src.list_webhooks(org, repo)
+    tw = tgt.list_webhooks(org, repo)
+    results.append(CheckResult(
+        name="settings:webhooks_count",
+        passed=(len(sw) == len(tw)),
+        source_value=str(len(sw)),
+        target_value=str(len(tw)),
+        notes="Webhook count (review URLs manually — they legitimately differ)",
+    ))
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
+
+CHECKS = [
+    ("Repo metadata",    check_repo_metadata),
+    ("Branches",         check_branches),
+    ("Tags",             check_tags),
+    ("Commits",          check_commits),
+    ("Pull requests",    check_pull_requests),
+    ("Issues",           check_issues),
+    ("Settings",         check_settings),
+]
+
+
+def validate_repo(src: GitHubClient, tgt: GitHubClient,
+                  org: str, repo: str, verbose: bool = True) -> RepoReport:
+    report = RepoReport(repo=repo)
+    if verbose:
+        print(f"\n  {'─'*60}")
+        print(f"  Validating: {repo}")
+    for label, fn in CHECKS:
+        try:
+            results = fn(src, tgt, org, repo)
+            report.checks.extend(results)
+            if verbose:
+                fails = [r for r in results if not r.passed]
+                status = "✓" if not fails else f"✗ ({len(fails)} fail)"
+                print(f"    {label:<25} {status}")
+        except Exception as e:
+            report.checks.append(CheckResult(
+                name=f"{label.lower().replace(' ', '_')}:error",
+                passed=False,
+                notes=f"Exception: {e}",
+            ))
+            if verbose:
+                print(f"    {label:<25} ✗ ERROR: {e}")
+    return report
+
+
+def run_validation(src: GitHubClient, tgt: GitHubClient,
+                   org: str, repos: Optional[list[str]],
+                   verbose: bool = True) -> MigrationReport:
+    report = MigrationReport(
+        org=org,
+        source_url=src.api_base,
+        target_url=tgt.api_base,
+        generated_at=datetime.utcnow().isoformat() + "Z",
+    )
+
+    if repos:
+        repo_list = repos
+    else:
+        if verbose:
+            print(f"\nFetching repository list for org '{org}'...")
+        repo_list = [r["name"] for r in src.list_repos(org)]
+        if verbose:
+            print(f"Found {len(repo_list)} repositories.")
+
+    for repo in repo_list:
+        rr = validate_repo(src, tgt, org, repo, verbose=verbose)
+        report.repo_reports.append(rr)
+
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Reporters
+# ---------------------------------------------------------------------------
+
+def render_json(report: MigrationReport) -> str:
+    return json.dumps(asdict(report), indent=2)
+
+
+def render_html(report: MigrationReport) -> str:
+    rows = []
+    for rr in report.repo_reports:
+        for c in rr.checks:
+            icon = "✅" if c.passed else "❌"
+            rows.append(f"""
+        <tr class="{'pass' if c.passed else 'fail'}">
+          <td>{rr.repo}</td>
+          <td>{c.name}</td>
+          <td>{icon}</td>
+          <td style="font-family:monospace;font-size:12px">{c.source_value}</td>
+          <td style="font-family:monospace;font-size:12px">{c.target_value}</td>
+          <td>{c.notes}</td>
+        </tr>""")
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>GitHub Migration Validation — {report.org}</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; margin: 2rem; color: #1a1a1a; }}
+  h1 {{ font-size: 1.4rem; }}
+  .summary {{ display: flex; gap: 2rem; margin: 1rem 0 2rem; }}
+  .card {{ background: #f5f5f5; border-radius: 8px; padding: 1rem 1.5rem; min-width: 120px; }}
+  .card .num {{ font-size: 2rem; font-weight: 600; }}
+  .card.green .num {{ color: #1a7f3c; }}
+  .card.red .num {{ color: #c0392b; }}
+  table {{ border-collapse: collapse; width: 100%; font-size: 13px; }}
+  th {{ background: #333; color: #fff; padding: 8px 12px; text-align: left; }}
+  td {{ padding: 6px 12px; border-bottom: 1px solid #e0e0e0; vertical-align: top; }}
+  tr.fail td {{ background: #fff5f5; }}
+  tr.pass td {{ background: #f5fff8; }}
+  .meta {{ font-size: 12px; color: #666; margin-bottom: 1rem; }}
+</style>
+</head>
+<body>
+<h1>GitHub Migration Validation Report — {report.org}</h1>
+<p class="meta">
+  Source: {report.source_url} &nbsp;→&nbsp; Target: {report.target_url}<br/>
+  Generated: {report.generated_at}
+</p>
+<div class="summary">
+  <div class="card green"><div class="num">{report.passed_repos}</div>Repos passed</div>
+  <div class="card red"><div class="num">{report.failed_repos}</div>Repos failed</div>
+  <div class="card"><div class="num">{report.total_repos}</div>Total repos</div>
+</div>
+<table>
+  <thead>
+    <tr>
+      <th>Repository</th><th>Check</th><th>Status</th>
+      <th>Source value</th><th>Target value</th><th>Notes</th>
+    </tr>
+  </thead>
+  <tbody>{''.join(rows)}
+  </tbody>
+</table>
+</body>
+</html>"""
+
+
+def save_reports(report: MigrationReport, output_dir: str, fmt: str):
+    os.makedirs(output_dir, exist_ok=True)
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    base = os.path.join(output_dir, f"migration_validation_{report.org}_{ts}")
+
+    if fmt in ("json", "both"):
+        path = f"{base}.json"
+        with open(path, "w") as f:
+            f.write(render_json(report))
+        print(f"\nJSON report: {path}")
+
+    if fmt in ("html", "both"):
+        path = f"{base}.html"
+        with open(path, "w") as f:
+            f.write(render_html(report))
+        print(f"HTML report: {path}")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Validate a GitHub org migration between two instances.")
+    p.add_argument("--source-url",   required=True, help="Source GitHub base URL")
+    p.add_argument("--source-token", required=True, help="Source PAT (or $SOURCE_TOKEN)")
+    p.add_argument("--target-url",   required=True, help="Target GitHub base URL")
+    p.add_argument("--target-token", required=True, help="Target PAT (or $TARGET_TOKEN)")
+    p.add_argument("--org",          required=True, help="GitHub org name")
+    p.add_argument("--repos",        nargs="*",     help="Specific repos (default: all)")
+    p.add_argument("--output-format", default="both",
+                   choices=["json", "html", "both"], help="Report format")
+    p.add_argument("--output-dir",   default="./migration_reports",
+                   help="Directory for output reports")
+    p.add_argument("--quiet",        action="store_true", help="Suppress progress output")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    # Allow tokens from environment variables
+    src_token = os.environ.get("SOURCE_TOKEN") or args.source_token
+    tgt_token = os.environ.get("TARGET_TOKEN") or args.target_token
+
+    src = GitHubClient(args.source_url, src_token)
+    tgt = GitHubClient(args.target_url, tgt_token)
+
+    verbose = not args.quiet
+    if verbose:
+        print(f"GitHub Migration Validator")
+        print(f"  Org:    {args.org}")
+        print(f"  Source: {src.api_base}")
+        print(f"  Target: {tgt.api_base}")
+
+    report = run_validation(src, tgt, args.org, args.repos, verbose=verbose)
+
+    save_reports(report, args.output_dir, args.output_format)
+
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"Summary: {report.passed_repos}/{report.total_repos} repos fully passed")
+        total_checks = sum(len(r.checks) for r in report.repo_reports)
+        failed_checks = sum(r.fail_count for r in report.repo_reports)
+        print(f"Checks:  {total_checks - failed_checks}/{total_checks} passed")
+
+    # Exit 1 if any repo failed (useful in CI pipelines)
+    sys.exit(0 if report.failed_repos == 0 else 1)
+
+
+if __name__ == "__main__":
+    main()
